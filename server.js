@@ -8,12 +8,15 @@ const multer = require('multer');
 const crypto = require('crypto');
 const { openDb } = require('./src/db');
 const layout = require('./src/layout');
+const transfer = require('./src/transfer');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = process.env.DB_FILE || path.join(DATA_DIR, 'workbench.db');
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
 const MAX_UPLOAD_MB = parseInt(process.env.MAX_UPLOAD_MB || '20', 10);
+// 方案包内含全部陶片照片，单包上限默认 200 MB。
+const MAX_PACKAGE_MB = parseInt(process.env.MAX_PACKAGE_MB || '200', 10);
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -362,6 +365,25 @@ function deleteImageFile(file) {
   fs.unlink(path.join(UPLOAD_DIR, path.basename(file)), () => {});
 }
 
+// 方案包导入：整包先读到内存（上限 MAX_PACKAGE_MB），校验全部通过后才落盘、入库。
+const packageUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_PACKAGE_MB * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    const ext = (path.extname(file.originalname) || '').toLowerCase();
+    if (ext !== '.zip') return cb(new HttpError(400, '仅支持 .zip 方案包'));
+    cb(null, true);
+  },
+});
+
+// 把 transfer.PackageError（含结构化 errors / violations）转成统一错误响应体。
+function packageErrorBody(err) {
+  const body = { message: err.message, reason: err.reason || 'import_package_invalid' };
+  if (err.errors && err.errors.length) body.errors = err.errors;
+  if (err.violations) body.violations = err.violations;
+  return body;
+}
+
 // ---------- API: 方案 ----------
 
 app.get('/api/health', (_req, res) => {
@@ -417,6 +439,133 @@ app.delete('/api/projects/:id', wrap((req, res) => {
   files.forEach(deleteImageFile);
   res.status(204).end();
 }));
+
+// ---------- 方案包：导出（自包含 ZIP 快照） / 导入（独立新方案）----------
+//
+// 导出 GET /api/projects/:id/export：
+//   只读、不需要 Base-Version。方案名/容差/快照版本、按采纳顺序排列的接缝、
+//   陶片（比例尺）与照片（SHA-256 + 字节数摘要 + 聚合 photos_digest）打包为 ZIP。
+//   全部读取在同一同步事务内完成——导出期间方案被编辑时，包内数据仍来自同一版本快照。
+//
+// 导入 POST /api/projects/import（multipart，字段 package 为 .zip）：
+//   创建“独立”新方案：本地 ID 全部重新分配，接缝按包内采纳顺序重建，
+//   from/to 重映射到新陶片 ID。整包校验（清单/参数/照片摘要/缺失重复文件/
+//   越界路径/全部闭合环超容差）；任一不过即整包拒绝，不留下方案或孤儿照片。
+
+app.get('/api/projects/:id/export', wrap((req, res) => {
+  const pid = num(req.params.id, 'id');
+  // 同一事务内取版本一致的方案/陶片/接缝快照并读入照片字节。
+  const snapshot = db.transaction(() => {
+    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(pid);
+    if (!project) throw new HttpError(404, '方案不存在');
+    const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ? ORDER BY id').all(pid);
+    const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+    const files = new Map();
+    for (const sh of sherds) {
+      const file = path.join(UPLOAD_DIR, path.basename(sh.image_file));
+      if (!fs.existsSync(file)) {
+        throw new HttpError(404, `陶片 #${sh.id} 的照片文件缺失，无法导出方案包`);
+      }
+      files.set(sh.id, fs.readFileSync(file));
+    }
+    return { project, sherds, seams, files };
+  })();
+
+  const { buffer, manifest, filename } = transfer.buildProjectPackage(snapshot);
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+  res.setHeader('X-Package-Format', transfer.PACKAGE_FORMAT);
+  res.setHeader('X-Package-Snapshot-Version', String(manifest.snapshot_version));
+  res.send(buffer);
+}));
+
+app.post('/api/projects/import', (req, res, next) => {
+  packageUpload.single('package')(req, res, (err) => {
+    if (err) return next(err);
+    handlePackageImport(req, res, next);
+  });
+});
+
+const handlePackageImport = wrap(async (req, res) => {
+  if (!req.file) throw new HttpError(400, '缺少方案包文件 package（multipart/form-data，字段名 package，.zip）');
+
+  let parsed;
+  try {
+    parsed = transfer.validateProjectPackage(req.file.buffer, { maxPhotoBytes: MAX_UPLOAD_MB * 1024 * 1024 });
+  } catch (e) {
+    if (e instanceof transfer.PackageError) {
+      // 校验阶段什么都还没写：天然不会留下方案或照片。
+      return res.status(e.status).json({ error: packageErrorBody(e) });
+    }
+    throw e;
+  }
+
+  // 先确定每张照片的落地文件名（与普通上传同一目录、随机命名），
+  // 事务失败时删除已写文件，确保不留孤儿照片。
+  const plans = transfer.planImportFilenames(parsed);
+  const written = [];
+  let newPid = null;
+
+  const txn = db.transaction(() => {
+    const pinfo = db
+      .prepare('INSERT INTO projects(name, tolerance_mm, version) VALUES (?, ?, 1)')
+      .run(parsed.name, parsed.tolerance_mm);
+    newPid = pinfo.lastInsertRowid;
+
+    const insSherd = db.prepare(
+      'INSERT INTO sherds(project_id, label, image_file, img_w, img_h, scale_px, scale_mm, note) ' +
+      'VALUES (?,?,?,?,?,?,?,?)'
+    );
+    // ref（源方案陶片 id）-> 新本地陶片 id
+    const idMap = new Map();
+    // 与包内 sherds 顺序（ref 升序）一致地插入；照片文件名已预先分配。
+    for (const plan of plans) {
+      const sh = plan.sherd;
+      const info = insSherd.run(
+        newPid, sh.label, plan.filename, sh.img_w, sh.img_h,
+        sh.scale_px, sh.scale_mm, sh.note
+      );
+      idMap.set(sh.ref, info.lastInsertRowid);
+    }
+
+    // 接缝按包内采纳顺序（ord 升序）依序插入：自增 id 即新方案的采纳排序，
+    // 与源方案 Kruskal 次序等价；端点重映射到新陶片 id。
+    const insSeam = db.prepare(
+      'INSERT INTO seams(project_id, from_id, to_id, theta_deg, tx, ty, join_note) VALUES (?,?,?,?,?,?,?)'
+    );
+    for (const se of parsed.seams) {
+      insSeam.run(newPid, idMap.get(se.from_ref), idMap.get(se.to_ref),
+        se.theta_deg, se.tx, se.ty, se.join_note);
+    }
+  });
+
+  try {
+    // 照片先落盘（随机文件名，不会覆盖任何既有文件），再单事务入库。
+    for (const plan of plans) {
+      fs.writeFileSync(path.join(UPLOAD_DIR, plan.filename), plan.sherd.data);
+      written.push(plan.filename);
+    }
+    txn();
+  } catch (e) {
+    // 落盘中途失败或事务回滚：删除本次已写的全部照片，不留孤儿文件。
+    written.forEach(deleteImageFile);
+    if (newPid !== null) {
+      // 事务正常情况下会整体回滚（外键级联，无陶片/接缝行）；
+      // 此 DELETE 仅作兜底，覆盖 better-sqlite3 事务语义之外的极端情况。
+      db.prepare('DELETE FROM projects WHERE id = ?').run(newPid);
+    }
+    throw e;
+  }
+
+  res.status(201).json({
+    ...statePayload(loadState(newPid)),
+    imported_from: {
+      snapshot_version: parsed.snapshot_version,
+      sherd_count: parsed.sherds.length,
+      seam_count: parsed.seams.length,
+    },
+  });
+});
 
 // ---------- API: 陶片 ----------
 
@@ -761,7 +910,9 @@ app.use((err, _req, res, _next) => {
     return res.status(err.status).json({ error: { message: err.message, ...err.extra } });
   }
   if (err && err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).json({ error: { message: `图片超过 ${MAX_UPLOAD_MB} MB 上限` } });
+    const limitMb = err.field === 'package' ? MAX_PACKAGE_MB : MAX_UPLOAD_MB;
+    const what = err.field === 'package' ? '方案包' : '图片';
+    return res.status(400).json({ error: { message: `${what}超过 ${limitMb} MB 上限` } });
   }
   console.error(err);
   res.status(500).json({ error: { message: '服务器内部错误' } });

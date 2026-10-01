@@ -22,6 +22,7 @@ export async function mountWorkspace(projectId) {
         <div class="footer">
           <button id="btn-new-seam">新建接缝</button>
           <button id="btn-batch">批量试拼</button>
+          <button class="secondary" id="btn-export">📦 导出方案包</button>
         </div>
       </aside>
 
@@ -548,6 +549,19 @@ export async function mountWorkspace(projectId) {
 
   // ---------- 新建接缝 ----------
   document.getElementById('btn-new-seam').onclick = chooseSeamEnds;
+
+  // ---------- 导出自包含方案包（快照即当前版本，只读）----------
+  document.getElementById('btn-export').onclick = () => {
+    // 普通 GET 下载：包内数据是该请求时刻同一版本的快照，与当前编辑互不影响。
+    const url = api.exportProjectUrl(state.project.id);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = '';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    toast('方案包下载已开始（含方案名、容差、照片/比例尺、接缝采纳顺序与校验摘要）', 'success');
+  };
 
   // ---------- 批量试拼（候选接缝一批试算 → 单事务确认）----------
   document.getElementById('btn-batch').onclick = () => {

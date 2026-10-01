@@ -60,4 +60,12 @@ export const api = {
       version,
       body: { candidates, base_version: baseVersion, batch_fingerprint: fingerprint },
     }).then((r) => r.data),
+  // 导出：GET 直接下载自包含 ZIP 快照（只读、无需 Base-Version）。
+  exportProjectUrl: (id) => `/api/projects/${id}/export`,
+  // 导入：multipart 上传 .zip 方案包，创建独立新方案并重分配本地 ID。
+  importPackage: (file) => {
+    const fd = new FormData();
+    fd.append('package', file);
+    return request('POST', '/api/projects/import', { body: fd }).then((r) => r.data);
+  },
 };

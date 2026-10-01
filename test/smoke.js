@@ -6,6 +6,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const http = require('http');
+const transfer = require('../src/transfer');
 
 process.env.DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'sherd-smoke-'));
 process.env.DB_FILE = path.join(process.env.DATA_DIR, 't.db');
@@ -60,6 +61,57 @@ function multipart(fields, fileBuf) {
     },
     payload,
   };
+}
+
+// 下载二进制（方案包 ZIP），返回 { status, buffer, headers, json }。
+function getBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const r = http.request({ host: '127.0.0.1', port: process.env.PORT, path: url, method: 'GET' }, (res) => {
+      const chunks = [];
+      res.on('data', (d) => chunks.push(d));
+      res.on('end', () => {
+        const buffer = Buffer.concat(chunks);
+        let json = null;
+        try { json = buffer.length ? JSON.parse(buffer.toString('utf8')) : null; } catch {}
+        resolve({ status: res.statusCode, buffer, headers: res.headers, json });
+      });
+    });
+    r.on('error', reject);
+    r.end();
+  });
+}
+
+// 上传方案包（multipart 字段 package，文件名可自定义后缀）。
+function uploadPackage(zipBuf, filename = 'pkg.zip') {
+  return new Promise((resolve, reject) => {
+    const boundary = '----pkg' + Math.random().toString(16).slice(2);
+    const crlf = '\r\n';
+    const head =
+      `--${boundary}${crlf}Content-Disposition: form-data; name="package"; filename="${filename}"` +
+      `${crlf}Content-Type: application/zip${crlf}${crlf}`;
+    const tail = `${crlf}--${boundary}--${crlf}`;
+    const payload = Buffer.concat([Buffer.from(head), zipBuf, Buffer.from(tail)]);
+    const r = http.request({
+      host: '127.0.0.1', port: process.env.PORT, path: '/api/projects/import', method: 'POST',
+      headers: { 'Content-Type': `multipart/form-data; boundary=${boundary}`, 'Content-Length': payload.length },
+    }, (res) => {
+      let chunks = '';
+      res.on('data', (d) => (chunks += d));
+      res.on('end', () => {
+        let json = null;
+        try { json = chunks ? JSON.parse(chunks) : null; } catch {}
+        resolve({ status: res.statusCode, json });
+      });
+    });
+    r.on('error', reject);
+    r.write(payload);
+    r.end();
+  });
+}
+
+// 解包并改包后重新压成 ZIP（entries: [{name,data}]，顺序自定义）。
+function repack(entries) {
+  return transfer.zipEntries(entries.map((e) => ({ name: e.name, data: e.data || Buffer.alloc(0) })));
 }
 
 async function main() {
@@ -581,6 +633,290 @@ async function main() {
   });
   assert(rr.status === 200 && rr.json.project.version === b2ver + 1, '桥接批确认成功，版本只 +1');
   assert(rr.json.seams.length === 4, '桥接批两条候选均已采纳');
+
+  // ===================== 方案包导出 / 导入（跨工作台交接） =====================
+  // 新方案：4 片 E0..E3 成链 + 一条闭合（残差 0），再加 1 片未标比例尺、未连通的 E4。
+  r = await req('POST', '/api/projects', { body: { name: '交接方案', tolerance_mm: 2 } });
+  assert(r.status === 201, '创建方案包导出测试方案');
+  const epid = r.json.project.id;
+  let ever = r.json.project.version;
+  const e = [];
+  for (let i = 0; i < 5; i++) {
+    const form = multipart({ label: `E${i}`, img_w: '100', img_h: '100' }, png);
+    const rr2 = await req('POST', `/api/projects/${epid}/sherds`, { version: ever, raw: form.payload, body: form });
+    if (rr2.status !== 201) throw new Error('交接方案上传失败: ' + JSON.stringify(rr2.json));
+    ever = rr2.json.project.version;
+    e.push(rr2.json.sherds[rr2.json.sherds.length - 1].id);
+  }
+  // 仅前 4 片标比例尺（E4 未标、未连通，也要在包内往返）。
+  for (let i = 0; i < 4; i++) {
+    r = await req('PATCH', `/api/sherds/${e[i]}/scale`, { version: ever, body: { scale_px: 100, scale_mm: 10 } });
+    assert(r.status === 200, '交接方案比例尺');
+    ever = r.json.project.version;
+  }
+  const seamDefs = [
+    [e[0], e[1], -10, 'E0-1'],
+    [e[1], e[2], -10, 'E1-2'],
+    [e[2], e[3], -10, 'E2-3'],
+    [e[0], e[3], -30, '闭合 E0-3'],
+  ];
+  for (const [f, t2, tx2, note] of seamDefs) {
+    r = await req('POST', `/api/projects/${epid}/seams`,
+      { version: ever, body: { from_id: f, to_id: t2, theta_deg: 0, tx: tx2, ty: 0, join_note: note } });
+    assert(r.status === 201, `交接方案建接缝 ${note}`);
+    ever = r.json.project.version;
+  }
+  const srcState = (await req('GET', `/api/projects/${epid}`)).json;
+  assert(srcState.layout.residuals[0].within_tolerance, '源方案闭合环在容差内');
+  const srcVersion = ever;
+
+  // 1) 导出：ZIP 含 manifest.json 与每片照片，清单字段齐全
+  let dl = await getBuffer(`/api/projects/${epid}/export`);
+  assert(dl.status === 200, '导出成功 200');
+  assert(dl.headers['content-type'] === 'application/zip', 'Content-Type 为 application/zip');
+  assert(/attachment/.test(dl.headers['content-disposition'] || ''), '以附件下载命名');
+  assert(String(dl.headers['x-package-snapshot-version']) === String(srcVersion), '响应头给出快照版本');
+  let zipEntriesNow = transfer.unzipEntries(dl.buffer);
+  const byName = new Map(zipEntriesNow.map((x) => [x.name, x.data]));
+  assert(byName.has('manifest.json'), '包内含 manifest.json');
+  const manifest = JSON.parse(byName.get('manifest.json').toString('utf8'));
+  assert(manifest.format === 'sherd-stitch-workbench-package' && manifest.format_version === 1, '清单格式标识/版本');
+  assert(manifest.project.name === '交接方案' && manifest.project.tolerance_mm === 2, '清单含方案名称与毫米容差');
+  assert(manifest.snapshot_version === srcVersion, '清单记录快照版本');
+  assert(manifest.sherds.length === 5, '清单含全部 5 片陶片（含未标比例尺的 E4）');
+  assert(manifest.seams.length === 4, '清单含 4 条接缝');
+  assert(manifest.seams.map((x) => x.ord).join(',') === '1,2,3,4', '接缝按采纳顺序排列（ord 1..4）');
+  assert(manifest.seams[3].from_ref === e[0] && manifest.seams[3].to_ref === e[3]
+    && manifest.seams[3].join_note === '闭合 E0-3', '闭合接缝内容与说明完整');
+  const e4m = manifest.sherds.find((x) => x.ref === e[4]);
+  assert(e4m.scale_px === null && e4m.scale_mm === null, '未标比例尺陶片以 null 记录');
+  assert(manifest.sherds.every((x) => /^photos\/\d+\.(jpg|png|webp)$/.test(x.image))
+    && byName.has(manifest.sherds[0].image), '每片照片以 photos/<ref>.<ext> 存放在包内');
+  assert(manifest.sherds.every((x) => /^[0-9a-f]{64}$/.test(x.sha256))
+    && manifest.digests && /^[0-9a-f]{64}$/.test(manifest.digests.photos_digest),
+    '每片照片有 SHA-256 摘要，且有聚合 photos_digest');
+
+  // 2) 快照一致性：导出（下载）期间方案被编辑，包仍来自同一版本快照。
+  //    用“发起 GET 后立刻 PATCH 改名推进版本”的窗口近似：GET 是同步处理的，
+  //    这里直接验证“导出包版本 == 请求时版本”，随后再改方案并确认下一次导出才反映新版本。
+  dl = await getBuffer(`/api/projects/${epid}/export`);
+  assert(JSON.parse(transfer.unzipEntries(dl.buffer).find((x) => x.name === 'manifest.json')
+    .data.toString('utf8')).snapshot_version === srcVersion, '导出包版本与当前版本一致（快照）');
+  r = await req('PATCH', `/api/projects/${epid}`, { version: ever, body: { name: '交接方案-导出后改名' } });
+  assert(r.status === 200, '导出后编辑方案推进版本');
+  ever = r.json.project.version;
+  dl = await getBuffer(`/api/projects/${epid}/export`);
+  const manifestAfter = JSON.parse(transfer.unzipEntries(dl.buffer).find((x) => x.name === 'manifest.json')
+    .data.toString('utf8'));
+  assert(manifestAfter.snapshot_version === srcVersion + 1 && manifestAfter.project.name === '交接方案-导出后改名',
+    '后续导出反映编辑后版本（旧包仍是旧快照，互不污染）');
+
+  // 用最新包做后续导入/损坏测试
+  const goodZip = dl.buffer;
+  function pkgEntries() {
+    return transfer.unzipEntries(goodZip).map((x) => ({ name: x.name, data: x.data }));
+  }
+
+  // 3) 导入成功：独立新方案、ID 重分配、接缝与照片正确关联、布局与源方案等价
+  const projectsBefore = (await req('GET', '/api/projects')).json.projects.map((x) => x.id);
+  const imp = await uploadPackage(goodZip);
+  assert(imp.status === 201, '导入方案包成功 201');
+  assert(imp.json.project.name === '交接方案-导出后改名', '新方案名称来自包内');
+  assert(imp.json.project.version === 1, '导入的独立方案版本从 v1 开始');
+  const newPid = imp.json.project.id;
+  assert(!projectsBefore.includes(newPid), '导入创建的是新的独立方案 ID');
+  assert(imp.json.imported_from.snapshot_version === srcVersion + 1
+    && imp.json.imported_from.sherd_count === 5 && imp.json.imported_from.seam_count === 4,
+    '导入响应给出来源快照版本与数量');
+
+  const dst = imp.json;
+  assert(dst.sherds.length === 5 && dst.seams.length === 4, '新方案陶片/接缝数量与源一致');
+  // 本地 ID 全部重分配：新陶片 id 不等于包内 ref（除非极小概率连续，这里用标签映射核对）
+  const labelToId = new Map(dst.sherds.map((x) => [x.label, x.id]));
+  const dstRefOf = (srcId) => labelToId.get(`E${e.indexOf(srcId)}`);
+  assert(dst.sherds.every((x) => x.id !== e[0] || newPid !== epid), '新方案在不同方案行内独立存在');
+  // 接缝端点重映射正确：ord1 应连接新的 E0/E1
+  const dstSeamsOrd = dst.seams.slice().sort((a, b) => a.id - b.id);
+  assert(dstSeamsOrd[0].from_id === dstRefOf(e[0]) && dstSeamsOrd[0].to_id === dstRefOf(e[1])
+    && dstSeamsOrd[0].join_note === 'E0-1', '接缝按采纳顺序重建且端点映射到新陶片 ID');
+  assert(dstSeamsOrd[3].from_id === dstRefOf(e[0]) && dstSeamsOrd[3].to_id === dstRefOf(e[3])
+    && dstSeamsOrd[3].join_note === '闭合 E0-3', '闭合接缝重映射正确');
+  // 照片可取回，且内容字节与源照片一致
+  const imgSrc = await getBuffer(`/api/sherds/${e[0]}/image`);
+  const imgDst = await getBuffer(`/api/sherds/${dstRefOf(e[0])}/image`);
+  assert(imgDst.status === 200 && imgDst.buffer.equals(imgSrc.buffer), '导入后照片内容与源陶片照片逐字节一致');
+
+  // 布局等价：按标签对齐成员与位姿（忽略新本地 id）
+  function normLayout(st) {
+    return {
+      groups: st.layout.groups.map((g) => {
+        const members = g.member_ids.slice().sort((a, b) => a - b);
+        const labels = members.map((id) => st.sherds.find((x) => x.id === id).label);
+        const poses = {};
+        for (const id of members) {
+          const p = g.poses[id];
+          poses[st.sherds.find((x) => x.id === id).label] = { x: p.x, y: p.y, theta: p.theta };
+        }
+        const treeLabels = g.tree_seam_ids.map((sid) => {
+          const s = st.seams.find((x) => x.id === sid);
+          return `${st.sherds.find((x) => x.id === s.from_id).label}>${st.sherds.find((x) => x.id === s.to_id).label}`;
+        }).sort();
+        return { labels, poses, treeLabels, root: st.sherds.find((x) => x.id === g.root_sherd_id).label };
+      }).sort((a, b) => a.labels.join() < b.labels.join() ? -1 : 1),
+      unconnected: st.layout.unconnected.map((id) => st.sherds.find((x) => x.id === id).label).sort(),
+      residuals: st.layout.residuals.map((x) => ({
+        edge: `${st.sherds.find((s2) => s2.id === x.from_id).label}>${st.sherds.find((s2) => s2.id === x.to_id).label}`,
+        d: x.distance_mm, rot: x.rotation_deg, within: x.within_tolerance,
+      })).sort((a, b) => a.edge < b.edge ? -1 : 1),
+    };
+  }
+  const srcNorm = normLayout(srcState);
+  const dstNorm = normLayout(dst);
+  assert(JSON.stringify(srcNorm) === JSON.stringify(dstNorm), '导入后布局（连通组/根/位姿/树边/未连通/闭合环残差）与源方案等价');
+  // 比例尺等价：新 E0..E3 已标，E4 未标
+  assert(dst.sherds.find((x) => x.label === 'E4').scale_px == null, '未标比例尺陶片导入后仍未标');
+  assert(dst.sherds.filter((x) => x.scale_px != null).length === 4, '4 片比例尺随包恢复');
+
+  // 4) 整包拒绝：非 ZIP / 不是 multipart 字段
+  let bad = await uploadPackage(Buffer.from('this is not a zip at all'));
+  assert(bad.status === 400 && bad.json.error.reason === 'import_package_unreadable', '非 ZIP 字节 => 400 整包拒绝');
+  // 扩展名不是 .zip（multer fileFilter 拦截）
+  bad = await uploadPackage(goodZip, 'pkg.txt');
+  assert(bad.status === 400, '非 .zip 扩展名 => 400');
+
+  // 5) 整包拒绝：各类清单/文件问题，且不留下方案或孤儿照片
+  async function expectReject(entries2, check) {
+    const before = (await req('GET', '/api/projects')).json.projects.length;
+    const uploadsBefore = fs.readdirSync(process.env.UPLOAD_DIR).filter((f) => f.startsWith('sherd_import_')).length;
+    const resp = await uploadPackage(repack(entries2));
+    assert(resp.status === 400 || resp.status === 422, `损坏/非法包应被拒绝（实际 ${resp.status}）`);
+    if (check) check(resp);
+    const after = (await req('GET', '/api/projects')).json.projects.length;
+    const uploadsAfter = fs.readdirSync(process.env.UPLOAD_DIR).filter((f) => f.startsWith('sherd_import_')).length;
+    assert(after === before, '拒绝后方案数量不变（不留下方案）');
+    assert(uploadsAfter === uploadsBefore, '拒绝后不留下孤儿照片文件');
+    return resp;
+  }
+
+  // 5a) manifest 非法 JSON
+  {
+    const es2 = pkgEntries();
+    es2.find((x) => x.name === 'manifest.json').data = Buffer.from('{not json');
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('合法 JSON')), '提示清单非 JSON'));
+  }
+  // 5b) 缺少清单
+  await expectReject(pkgEntries().filter((x) => x.name !== 'manifest.json'),
+    (resp) => assert(resp.json.error.errors.some((m) => m.includes('manifest.json')), '提示缺少 manifest.json'));
+  // 5c) 格式标识不符 / 版本不符
+  {
+    const es2 = pkgEntries(); const m2 = JSON.parse(es2.find((x) => x.name === 'manifest.json').data.toString('utf8'));
+    m2.format = 'something-else';
+    es2.find((x) => x.name === 'manifest.json').data = Buffer.from(JSON.stringify(m2));
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('格式标识')), '提示格式标识不符'));
+  }
+  {
+    const es2 = pkgEntries(); const m2 = JSON.parse(es2.find((x) => x.name === 'manifest.json').data.toString('utf8'));
+    m2.format_version = 99;
+    es2.find((x) => x.name === 'manifest.json').data = Buffer.from(JSON.stringify(m2));
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('格式版本')), '提示格式版本不受支持'));
+  }
+  // 5d) 参数越界：容差非法
+  {
+    const es2 = pkgEntries(); const m2 = JSON.parse(es2.find((x) => x.name === 'manifest.json').data.toString('utf8'));
+    m2.project.tolerance_mm = -1;
+    es2.find((x) => x.name === 'manifest.json').data = Buffer.from(JSON.stringify(m2));
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('容差')), '提示容差越界'));
+  }
+  // 5e) 接缝参数非法（theta 越界）
+  {
+    const es2 = pkgEntries(); const m2 = JSON.parse(es2.find((x) => x.name === 'manifest.json').data.toString('utf8'));
+    m2.seams[0].theta_deg = 999;
+    es2.find((x) => x.name === 'manifest.json').data = Buffer.from(JSON.stringify(m2));
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('theta_deg')), '提示接缝参数非法'));
+  }
+  // 5f) 接缝端点引用不存在的陶片
+  {
+    const es2 = pkgEntries(); const m2 = JSON.parse(es2.find((x) => x.name === 'manifest.json').data.toString('utf8'));
+    m2.seams[0].to_ref = 999999;
+    es2.find((x) => x.name === 'manifest.json').data = Buffer.from(JSON.stringify(m2));
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('不在本方案包内')), '提示端点陶片缺失'));
+  }
+  // 5g) 照片缺失（清单引用但包内无此文件）
+  {
+    const es2 = pkgEntries();
+    const m2 = JSON.parse(es2.find((x) => x.name === 'manifest.json').data.toString('utf8'));
+    const victim = m2.sherds[0].image;
+    await expectReject(es2.filter((x) => x.name !== victim),
+      (resp) => assert(resp.json.error.errors.some((m) => m.includes('缺少照片')), '提示照片文件缺失'));
+  }
+  // 5h) 照片重复条目（ZIP 内同名文件出现两次）
+  {
+    const es2 = pkgEntries();
+    es2.push({ name: es2[1].name, data: Buffer.from('dup') });
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('重复文件')), '提示包内重复文件'));
+  }
+  // 5i) 越界路径：../escape 与绝对路径 / 清单未引用的多余文件
+  {
+    const es2 = pkgEntries();
+    es2.push({ name: '../evil.png', data: png });
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('越界')), '提示路径越界（..）'));
+  }
+  {
+    const es2 = pkgEntries();
+    es2.push({ name: 'photos/rogue.jpg', data: Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 0]) });
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('多余文件')), '提示清单未引用的多余文件'));
+  }
+  // 5j) 照片内容与摘要不符（损坏/替换照片）
+  {
+    const es2 = pkgEntries();
+    const photo = es2.find((x) => x.name.startsWith('photos/'));
+    const corrupted = Buffer.concat([photo.data.slice(0, 10), Buffer.from([99]), photo.data.slice(11)]);
+    photo.data = corrupted;
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('SHA-256')), '提示照片摘要不符'));
+  }
+  // 5k) 篡改照片后把单片 sha256 改对，但聚合 photos_digest 不更新 => 仍拒绝
+  {
+    const es2 = pkgEntries();
+    const m2 = JSON.parse(es2.find((x) => x.name === 'manifest.json').data.toString('utf8'));
+    const photoName = m2.sherds[0].image;
+    const photo = es2.find((x) => x.name === photoName);
+    photo.data = Buffer.concat([photo.data, Buffer.from([7])]);
+    m2.sherds[0].bytes = photo.data.length;
+    m2.sherds[0].sha256 = require('crypto').createHash('sha256').update(photo.data).digest('hex');
+    // photos_digest 保持旧值
+    es2.find((x) => x.name === 'manifest.json').data = Buffer.from(JSON.stringify(m2));
+    await expectReject(es2, (resp) => assert(resp.json.error.errors.some((m) => m.includes('photos_digest')), '提示聚合照片摘要不符'));
+  }
+
+  // 6) 几何拒绝：篡改接缝使闭合环超容差（同时改对所有摘要），整包 422
+  {
+    const es2 = pkgEntries();
+    const m2 = JSON.parse(es2.find((x) => x.name === 'manifest.json').data.toString('utf8'));
+    // 生成树接缝 E1->E2 从 -10 改成 -14，闭合 E0->E3 残差将变 4mm > 2mm
+    const tree = m2.seams.find((x) => x.join_note === 'E1-2');
+    tree.tx = -14;
+    es2.find((x) => x.name === 'manifest.json').data = Buffer.from(JSON.stringify(m2));
+    const before = (await req('GET', '/api/projects')).json.projects.length;
+    const resp = await uploadPackage(repack(es2));
+    assert(resp.status === 422 && resp.json.error.reason === 'import_cycle_tolerance_exceeded',
+      '包内闭合环超容差 => 422 整包拒绝');
+    assert(resp.json.error.violations[0].deviation_mm === 4, '422 给出超差偏差（4mm）与超差环');
+    const after = (await req('GET', '/api/projects')).json.projects.length;
+    assert(after === before, '422 后同样不留下方案');
+  }
+
+  // 7) 导入的方案是独立可编辑的：在新方案上修订/加接缝并再次导出，可二次导入
+  r = await req('POST', `/api/projects/${newPid}/seams`, {
+    version: 1,
+    body: { from_id: dstRefOf(e[3]), to_id: dstRefOf(e[4]), theta_deg: 0, tx: 0, ty: 0 },
+  });
+  assert(r.status === 400, '未标比例尺的 E4 仍不能参与接缝（与既有规则一致）');
+  // 二次导出 → 二次导入：ID 再次重分配，依然等价
+  const dl2 = await getBuffer(`/api/projects/${newPid}/export`);
+  assert(dl2.status === 200, '导入后的方案可再次导出');
+  const imp2 = await uploadPackage(dl2.buffer);
+  assert(imp2.status === 201 && imp2.json.project.id !== newPid, '二次导入再建独立方案');
+  assert(JSON.stringify(normLayout(imp2.json)) === JSON.stringify(dstNorm), '二次导入布局仍与源等价');
 
   console.log('\n全部冒烟检查通过 ✅');
   process.exit(0);
