@@ -1,5 +1,5 @@
 import { api } from './api.js';
-import { esc, toast } from './ui.js';
+import { esc, toast, openModal } from './ui.js';
 import { mountWorkspace } from './workspace.js';
 
 async function renderHome() {
@@ -18,6 +18,11 @@ async function renderHome() {
           <input type="number" id="np-tol" min="0.01" step="0.1" value="2" />
         </label>
         <button id="np-create">新建方案</button>
+        <span style="flex-basis:100%;height:0;margin:0"></span>
+        <label class="import-box" id="import-box">
+          📦 导入方案包（.zip，自包含；创建为独立新方案）
+          <input type="file" id="import-input" accept=".zip,application/zip" hidden />
+        </label>
       </div>
 
       <table class="list">
@@ -45,6 +50,53 @@ async function renderHome() {
     const state = await api.createProject(name, tol);
     location.hash = `#/project/${state.project.id}`;
   };
+
+  const importInput = document.getElementById('import-input');
+  document.getElementById('import-box').addEventListener('click', (e) => {
+    if (e.target.tagName !== 'INPUT') importInput.click();
+  });
+  importInput.addEventListener('change', async () => {
+    const file = importInput.files[0];
+    importInput.value = '';
+    if (!file) return;
+    try {
+      const fd = new FormData();
+      fd.append('package', file, file.name);
+      const { data, status } = await api.importPackage(fd);
+      if (status === 201) {
+        toast(`已导入为独立新方案「${data.project.name}」（${data.sherds.length} 片陶片、${data.seams.length} 条接缝）`, 'success');
+        location.hash = `#/project/${data.project.id}`;
+      }
+    } catch (e) {
+      showImportError(e);
+    }
+  });
+}
+
+// 导入失败：损坏/不合法整包拒绝。逐条列出清单/照片/路径问题或闭合环超差，
+// 并明确“未创建任何方案”。
+function showImportError(err) {
+  const info = err.data && err.data.error;
+  const issues = info && Array.isArray(info.issues) ? info.issues : [];
+  const isCycle = info && info.reason === 'import_cycle_tolerance_exceeded';
+  const detail = issues.length
+    ? `<div class="import-issues">${issues.slice(0, 50).map((it) => {
+      if (it.tolerance_mm !== undefined) {
+        return `<div class="imp-it">🔗 接缝 #${it.seam_seq}（陶片 ${it.from_seq}→${it.to_seq}）闭合残差 `
+          + `${it.deviation_mm} mm / ${it.rotation_deg}°，超过容差 ${it.tolerance_mm} mm，整包拒绝。</div>`;
+      }
+      return `<div class="imp-it">${esc(it.path ? `[${it.path}] ` : '')}${esc(it.message)}</div>`;
+    }).join('')}${issues.length > 50 ? `<div class="kv">其余 ${issues.length - 50} 项从略。</div>` : ''}</div>`
+    : '';
+  const { body } = openModal({ title: isCycle ? '🚫 导入被拒绝：闭合环超容差' : '🚫 方案包不合法，整包拒绝' });
+  body.innerHTML = `
+    <div class="conflict-box">
+      <div>${esc(info ? info.message : err.message)}</div>
+      ${detail}
+      <div class="kv" style="margin-top:8px">未创建任何方案，也不会留下照片文件。请在源工作台核对后重新导出。</div>
+    </div>
+    <div class="actions"><button id="imp-ok">知道了</button></div>`;
+  body.querySelector('#imp-ok').onclick = () => body.closest('.modal-mask').remove();
 }
 
 async function route() {

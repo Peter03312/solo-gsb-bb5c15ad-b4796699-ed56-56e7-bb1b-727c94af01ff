@@ -709,7 +709,12 @@ export async function mountWorkspace(projectId) {
   function renderTopbar() {
     document.getElementById('topbar-right').innerHTML = `
       <span class="ver">方案 v${state.project.version} · 容差 ${state.project.tolerance_mm} mm</span>
+      <button class="ghost" id="btn-export" title="导出当前版本快照为自包含 ZIP 方案包（含名称、容差、陶片照片与比例尺、按采纳顺序排列的接缝及照片校验摘要）">📦 导出方案包</button>
       <a href="#/" style="color:#f6efe2;font-size:13px">← 方案列表</a>`;
+    // 导出是同一版本快照的只读 GET：直接触发浏览器下载，无需 Base-Version。
+    document.getElementById('btn-export').onclick = () => {
+      window.location.href = api.exportPackageUrl(state.project.id);
+    };
   }
 
   renderAll();

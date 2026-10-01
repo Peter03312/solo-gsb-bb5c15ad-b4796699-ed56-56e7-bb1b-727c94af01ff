@@ -152,6 +152,18 @@ table.list a { color: var(--accent); font-weight: 600; text-decoration: none; }
 }
 .upload-box:hover { background: #f7f1e4; }
 
+.import-box {
+  display: block; flex-basis: 100%;
+  border: 1px dashed var(--sel); border-radius: 8px;
+  padding: 10px 12px; font-size: 13px; color: #2b5a8f; cursor: pointer; background: #f0f5fb;
+}
+.import-box:hover { background: #e3edf8; }
+.import-issues { margin-top: 8px; max-height: 260px; overflow: auto; }
+.import-issues .imp-it {
+  font-size: 12px; background: #fff; border: 1px solid var(--line); border-radius: 6px;
+  padding: 6px 8px; margin-bottom: 6px; word-break: break-all;
+}
+
 /* ---------- 弹窗 ---------- */
 #modal-host { position: fixed; inset: 0; pointer-events: none; z-index: 50; }
 .modal-mask {

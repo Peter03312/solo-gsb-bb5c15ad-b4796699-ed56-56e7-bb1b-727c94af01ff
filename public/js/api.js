@@ -60,4 +60,8 @@ export const api = {
       version,
       body: { candidates, base_version: baseVersion, batch_fingerprint: fingerprint },
     }).then((r) => r.data),
+  // 方案移交包：导出为自包含 ZIP（同一版本快照，只读）；导入创建独立新方案。
+  exportPackageUrl: (pid) => `/api/projects/${pid}/export`,
+  importPackage: (formData) =>
+    request('POST', '/api/projects/import', { body: formData }).then((r) => ({ data: r.data, status: r.status })),
 };

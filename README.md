@@ -11,6 +11,7 @@
 - **批量试拼候选接缝（本轮新增）**：把若干条候选接缝作为**一批**按顺序填写（每条：两端陶片、旋转角 θ、毫米平移、说明），先做**只读试算**——**已有接缝优先**，候选按填写顺序参与布局，工作台给出整批加入后的**连通组、陶片位姿及每个闭合环残差**，超差时指出**候选序号、偏差与冲突链**；试算不改接缝和版本。确认必须使用**同一批内容**及**试算所基于的方案版本**，服务器在**单事务**内重新校验全部闭合环，通过才**依序采纳且版本只增加一次**，否则**整批不生效**（422）；方案版本已变化返回 **409** 并要求重新试算。陶片不属于本方案、未标比例尺、接缝连接同一片或参数非法时整批拒绝（400，逐条指出候选序号）。
 - **撤销接缝即整体重算**连通组与位姿（布局从不持久化），不会沿用失效布局。
 - **多人编辑乐观锁**：每个写请求须带 `Base-Version`；版本落后时返回 `409` 并在网页弹窗提示，绝不静默覆盖；页面还会每 10 秒轮询版本并提示他人更新。
+- **方案移交包（本轮新增）**：把整个方案导出为**自包含 ZIP**（方案名称、毫米容差、陶片照片及毫米比例尺、按采纳顺序排列的接缝、每张照片的 SHA-256 校验摘要）；导出在单个读事务内取**同一版本快照**，导出期间即使方案被编辑，包内数据仍一致。另一台工作台导入 ZIP 时创建**独立新方案**、**重分配本地 ID** 并按顺序重新关联接缝与照片，**布局（连通组/位姿）与全部闭合环结果与源方案等价**。导入前逐项检查**清单、参数、照片摘要、缺失/重复/多余文件、越界路径、照片魔数与全部闭合环是否超容差**；任何损坏或不合法都**整包拒绝**（400/422），不留下方案或孤儿照片。网页首页可导入、方案页可下载，同时提供可调用的 HTTP API。
 
 ## 运行方式
 
@@ -52,7 +53,7 @@ npm start
 npm test        # 即 node test/smoke.js
 ```
 
-覆盖：建表就绪 → 建方案/上传/比例尺 → 接缝拼组与位姿传播 → 撤销断组重算 → 成环残差为 0 采纳 → 成环超差 422 拒绝且布局不变 → 过期版本 409 / 缺版本 428 → 接缝修订预览（只读、不改版本/接缝、给出超差冲突链）→ 修订确认 422 原子拒绝 / 容差内成功（ID 与排序不变、版本 +1、读取布局与预览一致）/ 409 / 428 / 400 / 404 → 修订成环接缝与仅改说明 → **批量试拼**：只读试算（既有接缝优先、候选按序为生成树/成环、位姿/残差/候选序号+冲突链、不改版本）→ 前置校验 400（同片/参数非法/陶片不属于方案/空批）→ 超差批 422 整批回滚 → 指纹不符 400 / 缺版本 428 / 版本变化 409 要求重试算 → 成功依序采纳且版本只 +1、读取布局与试算一致 → 批内桥接两个连通组并成环。
+覆盖：建表就绪 → 建方案/上传/比例尺 → 接缝拼组与位姿传播 → 撤销断组重算 → 成环残差为 0 采纳 → 成环超差 422 拒绝且布局不变 → 过期版本 409 / 缺版本 428 → 接缝修订预览（只读、不改版本/接缝、给出超差冲突链）→ 修订确认 422 原子拒绝 / 容差内成功（ID 与排序不变、版本 +1、读取布局与预览一致）/ 409 / 428 / 400 / 404 → 修订成环接缝与仅改说明 → **批量试拼**：只读试算（既有接缝优先、候选按序为生成树/成环、位姿/残差/候选序号+冲突链、不改版本）→ 前置校验 400（同片/参数非法/陶片不属于方案/空批）→ 超差批 422 整批回滚 → 指纹不符 400 / 缺版本 428 / 版本变化 409 要求重试算 → 成功依序采纳且版本只 +1、读取布局与试算一致 → 批内桥接两个连通组并成环 → **方案移交包**：导出同一版本快照 ZIP（清单/照片/摘要、未标定陶片、快照版本响应头）→ 导入创建独立新方案且本地 ID 重分配、接缝照片重新关联、位姿/残差/未连通片等价 → 空方案导出导入 → 各类损坏/非法包整包拒绝（非 ZIP、截断、缺/重复/多余文件、越界路径、照片 SHA-256 与魔数、清单参数、接缝引用/同片/引用未标定片、format、seq 不连续、CRC32）→ 闭合环超差 422（序号/偏差/冲突链）→ 非 .zip / 错字段 400 → 拒绝后无方案、无孤儿照片。
 
 ## 使用说明
 
@@ -91,6 +92,19 @@ npm test        # 即 node test/smoke.js
      服务器在**单事务**内重新读取并复核全部闭合环：通过才按填写顺序逐条采纳、
      **版本只增加一次**，随后画布与试算完全一致；若期间他人已改方案则返回 409，
      弹窗关闭并提示**重新试算**；重算仍超差则 422、整批不生效，弹窗会基于服务器当前状态重新试算。
+10. **移交方案给另一台工作台**：
+    - **导出**：方案页右上角点 **📦 导出方案包**，浏览器下载 `<方案名>.zip`。
+      导出是只读操作（不需要 `Base-Version`、不推进版本）；服务器在**单个读事务内**
+      读取方案/陶片/接缝行并读出全部照片字节——**导出期间即使方案被他人编辑，
+      包内数据仍全部来自同一版本快照**（响应头 `X-Snapshot-Version` 标明该版本）。
+    - **导入**：在**首页**点 **📦 导入方案包**，选择 `.zip`。服务器先在内存中做
+      **整包校验**（见下），通过后才写入；成功后跳转到**新建的独立方案**——
+      它有自己的本地 ID（陶片按包内顺序、接缝按采纳顺序重新编号），与源方案、
+      与此前任何导入副本都互不影响，**布局与闭合环结果与源方案等价**。
+    - **整包拒绝**：不是合法 ZIP、清单缺失/损坏/参数非法、照片缺失或 SHA-256
+      不符、文件重复/多余、路径越界（含 `..`、绝对路径、反斜杠、盘符）、
+      照片内容与扩展名不符，或**任一闭合环残差超过包内毫米容差**，都会被整包拒绝，
+      网页弹窗逐条列出问题；此时**不会创建方案，也不会留下任何照片文件**。
 
 ## 可配置项
 
@@ -103,6 +117,7 @@ npm test        # 即 node test/smoke.js
 | `DB_FILE` | `$DATA_DIR/workbench.db` | SQLite 数据库文件路径 |
 | `UPLOAD_DIR` | `$DATA_DIR/uploads` | 陶片图片保存目录 |
 | `MAX_UPLOAD_MB` | `20` | 单张照片上传大小上限（MB） |
+| `MAX_PACKAGE_MB` | `100` | 导入方案包（.zip）大小上限（MB） |
 
 方案级的**毫米容差**在网页“方案设置”中按方案独立配置，不是环境变量。
 
@@ -256,8 +271,115 @@ curl -s -X PATCH http://localhost:8080/api/seams/1 \
 
 既有单条接缝接口与返回契约保持不变：`POST /api/projects/{id}/seams`（采纳/成环拒绝）、
 `DELETE /api/seams/{id}`（撤销）、`GET /api/projects/{id}`（读取现算布局）。
-本轮新增的批量接口为 `POST /api/projects/{id}/seams/batch-preview`（只读试算）与
+批量接口 `POST /api/projects/{id}/seams/batch-preview`（只读试算）与
 `POST /api/projects/{id}/seams/batch-commit`（单事务确认），均不改变上述既有约定。
+
+## 方案移交 HTTP API（可调用）：导出 / 导入 ZIP
+
+自包含 ZIP 包，可直接交给另一台工作台（或同一台机器）导入。导出只读、不需要
+`Base-Version`；导入创建**独立新方案**，也不需要 `Base-Version`（它不修改任何
+既有方案）。
+
+### 包结构
+
+```
+project.zip
+├── manifest.json                 # 清单（DEFLATE 压缩）
+└── photos/
+    ├── sherd-0001.jpg            # 陶片照片（STORED 原样保存）
+    ├── sherd-0002.png
+    └── …
+```
+
+`manifest.json`：
+
+- `format`：固定 `"sherd-stitch-workbench"`；`format_version`：当前 `1`。
+- `exported_at`：导出时间（UTC ISO 字符串）。
+- `source`：源方案信息 `{ project_id, name, tolerance_mm, version }`（导出快照版本，仅作记录）。
+- `project`：`{ name, tolerance_mm }`——新方案将使用的名称与毫米容差。
+- `sherds[]`：按源本地 id 升序编号 `seq`（从 1 起连续），每条含
+  `label` / `note`、`photo`（包内相对路径）、`photo_sha256`（小写 64 位十六进制）、
+  `photo_bytes`、`img_w` / `img_h`、`scale_px` / `scale_mm`（未标比例尺时两者均为 `null`）。
+- `seams[]`：**按采纳顺序**排列，`seq` 即从 1 起的位置；每条含
+  `from_seq` / `to_seq`（引用陶片 `seq`，不引用源本地 id）、
+  `theta_deg` / `tx` / `ty` / `join_note`。
+
+### 导出（只读，同一版本快照）
+
+```
+GET /api/projects/{id}/export
+```
+
+- `200`：`Content-Type: application/zip`、`Content-Disposition: attachment`；
+  响应头 `X-Snapshot-Version` 为导出快照版本、`X-Snapshot-Project-Id` 为源方案 id。
+  行数据与照片字节全部在同一个读事务内取得；导出期间方案被编辑不影响本包一致性。
+- `404`：方案不存在。
+
+### 导入（创建独立新方案）
+
+```
+POST /api/projects/import
+Content-Type: multipart/form-data
+```
+
+表单字段：
+
+- `package`：方案包文件（文件名需以 `.zip` 结尾）。
+
+服务器在写库前完成**全部整包校验**：ZIP 结构与 CRC32、清单格式/字段/参数范围、
+照片 SHA-256 与字节数、缺失/重复/多余文件、越界或非法路径（仅允许
+`manifest.json` 与 `photos/` 下单段安全文件名）、照片魔数（JPG/PNG/WebP）
+与扩展名一致、接缝引用合法（端点存在、不相同、均已标比例尺）、
+陶片/接缝 `seq` 从 1 起连续；随后用导入后的本地 id 以同一布局引擎复核
+**全部闭合环**。
+
+- `201`：成功创建独立新方案，响应体即 `GET /api/projects/{newId}` 标准负载，另附
+  `imported: true` 与 `source`（源方案记录，可为 null）。陶片按 `seq` 顺序取得
+  连续的新本地 id；接缝按采纳顺序插入，两端重映射到新 id；新版本从 `v1` 开始。
+  布局（连通组、每片世界位姿、未连通陶片）与全部闭合环残差与源方案等价。
+- `400`：包损坏或不合法。`error.reason` 为 `package_unreadable`（ZIP 层）或
+  `package_invalid`（清单/文件层），`error.issues[]` 逐条给出 `{ path, message }`。
+  **不创建方案、不写照片。**
+- `422`：`error.reason = "import_cycle_tolerance_exceeded"`——几何复核发现
+  闭合环超容差；`issues[]` 逐条给出 `seam_seq` / `from_seq` / `to_seq` /
+  `deviation_mm` / `rotation_deg` / `tolerance_mm` 与冲突链
+  （`sherd_seqs` / `seam_seqs` / `closing_seam_seq`）。同样不留任何数据。
+
+### curl 示例
+
+```bash
+# 1) 在 A 工作台导出方案 7（响应头里能看到快照版本）
+curl -sS -D - -o ~/h3-pot.zip http://workbench-a:8080/api/projects/7/export
+#   HTTP/1.1 200 OK
+#   Content-Type: application/zip
+#   X-Snapshot-Version: 12
+#   X-Snapshot-Project-Id: 7
+
+# 2) 在 B 工作台导入（创建独立新方案，重分配本地 ID）
+curl -sS -X POST http://workbench-b:8080/api/projects/import \
+  -F 'package=@/path/to/h3-pot.zip;type=application/zip'
+# => 201 {"project":{"id":3,"name":"…","tolerance_mm":2,"version":1,…},
+#         "sherds":[…],"seams":[…],"layout":{…},"imported":true,"source":{…}}
+
+# 3) 损坏/非法包 => 400，issues[] 逐条列出问题
+curl -sS -X POST http://workbench-b:8080/api/projects/import -F 'package=@broken.zip'
+# => 400 {"error":{"message":"方案包校验未通过（2 项问题），整包拒绝",
+#         "reason":"package_invalid",
+#         "issues":[{"path":"photos/sherd-0001.png","message":"…SHA-256 校验失败…"}, …]}}
+```
+
+Python（requests）示例：
+
+```python
+import requests
+
+with open('h3-pot.zip', 'rb') as f:
+    r = requests.post('http://workbench-b:8080/api/projects/import',
+                      files={'package': ('h3-pot.zip', f, 'application/zip')})
+r.raise_for_status()
+state = r.json()
+print('新方案 id:', state['project']['id'], '陶片:', len(state['sherds']), '接缝:', len(state['seams']))
+```
 
 ## 数据模型
 
@@ -268,18 +390,25 @@ curl -s -X PATCH http://localhost:8080/api/seams/1 \
   **不改 id / from_id / to_id**，因此采纳排序（Kruskal 次序）稳定。
 - 每次写事务都会把 `projects.version + 1`；布局（连通组、位姿）**只在读取时现算**，
   不入库，因此撤销/修订后天然不会残留旧位置。接缝修订的预览也只现算、不落库。
+- 移交包不携带本地自增 id：陶片以导出顺序 `seq`、接缝以采纳顺序 `seq` 互相引用；
+  导入时创建新方案并按 `seq` 顺序重分配本地 id（陶片连续编号、接缝按序插入），
+  因此导入副本与源方案完全解耦，而布局引擎依据“最小 id 为根 + 采纳序”算出的
+  连通组、位姿与闭合环结果与源方案等价。导入不产生写冲突，故不需要 `Base-Version`，
+  新方案版本从初始 `v1` 开始。
 
 ## 目录结构
 
 ```
-server.js              Express 入口与 REST API（含乐观锁、成环拒绝、接缝修订预览/确认、批量试拼试算/确认、上传）
+server.js              Express 入口与 REST API（含乐观锁、成环拒绝、接缝修订预览/确认、批量试拼试算/确认、移交包导出/导入、上传）
 src/db.js              SQLite 打开与建表
 src/geo.js             刚体变换（旋转/平移、求逆、复合、偏差度量）纯函数
 src/layout.js          连通组/生成树(Kruskal 采纳序)/位姿传播/成环评估/残差/接缝修订重算(evaluateSeamRevision)/批量试算(evaluateSeamBatch)
+src/zip.js             无依赖 ZIP 读写（STORED/DEFLATE、CRC32 校验，仅供移交包）
+src/package.js         移交包清单构建(buildPackage)/整包校验与闭合环复核(inspectPackage)
 public/                前端（原生 ES Module + Canvas，无需构建）
   index.html, css/style.css
-  js/app.js            路由与首页
-  js/workspace.js      工作台三栏、画布绘制与交互、轮询
+  js/app.js            路由与首页（含导入方案包）
+  js/workspace.js      工作台三栏、画布绘制与交互、轮询、导出方案包按钮
   js/modals.js         比例尺标定弹窗、接缝对齐弹窗
   js/revise.js         接缝修订弹窗（改参 → 自动预览位姿/残差/冲突链 → 确认）
   js/batch.js          批量试拼弹窗（按序填候选 → 只读试算连通组/位姿/闭合环 → 同批同事单事务确认）

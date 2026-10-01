@@ -8,12 +8,14 @@ const multer = require('multer');
 const crypto = require('crypto');
 const { openDb } = require('./src/db');
 const layout = require('./src/layout');
+const pkg = require('./src/package');
 
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_FILE = process.env.DB_FILE || path.join(DATA_DIR, 'workbench.db');
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
 const MAX_UPLOAD_MB = parseInt(process.env.MAX_UPLOAD_MB || '20', 10);
+const MAX_PACKAGE_MB = parseInt(process.env.MAX_PACKAGE_MB || String(pkg.MAX_PACKAGE_MB_DEFAULT), 10);
 
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -418,6 +420,165 @@ app.delete('/api/projects/:id', wrap((req, res) => {
   res.status(204).end();
 }));
 
+// ---------- 方案移交包：导出 / 导入（自包含 ZIP）----------
+//
+// 导出：单个同步读事务内取同一版本快照（方案/陶片/接缝行），照片在事务内读取，
+//       保证“导出期间方案被编辑，包内数据仍来自同一版本快照”。
+//       包内 manifest 记录导出时的快照版本 X-Snapshot-Version。
+// 导入：整包先在内存中完成全部校验（清单/参数/照片摘要/缺失重复文件/越界路径/
+//       照片魔数/全部闭合环），通过后才写盘建库；任何不合法都整包拒绝，
+//       不留下方案，也不留下孤儿照片。导入创建的是独立新方案（id 重新分配，
+//       陶片按 seq 顺序、接缝按采纳顺序取得本地 id），与源方案完全解耦。
+
+// 方案包经 multipart 上传（字段 package，.zip）；内存存储——校验通过前不落盘。
+const pkgUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_PACKAGE_MB * 1024 * 1024, files: 1 },
+  fileFilter: (_req, file, cb) => {
+    const okExt = /\.(zip)$/i.test(path.extname(file.originalname) || '');
+    const okMime = !file.mimetype || /zip|octet-stream|x-zip-compressed/.test(file.mimetype);
+    if (!okExt || !okMime) return cb(new HttpError(400, '方案包必须是 .zip 文件'));
+    cb(null, true);
+  },
+});
+
+function safeDownloadName(name) {
+  const base = String(name || 'project').replace(/[\\/:*?"<>|\x00-\x1f]+/g, '_').replace(/\s+/g, ' ').trim() || 'project';
+  return base.slice(0, 80);
+}
+
+// 取同一版本快照并在事务内读照片：better-sqlite3 事务同步执行，期间不会插入
+// 其它写事务；照片字节也必须在事务内一次性读入内存——否则事务返回后、读文件前
+// 若另一请求删除陶片并 unlink 照片，导出会混入不一致状态。如此保证“导出期间
+// 方案被编辑，包内数据（行与照片字节）仍全部来自同一版本快照”。
+function snapshotPackage(pid) {
+  const readAll = db.transaction(() => {
+    const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(pid);
+    if (!project) return null;
+    const sherds = db.prepare('SELECT * FROM sherds WHERE project_id = ? ORDER BY id').all(pid);
+    const seams = db.prepare('SELECT * FROM seams WHERE project_id = ? ORDER BY id').all(pid);
+    const photosByFile = new Map();
+    for (const s of sherds) {
+      const file = path.join(UPLOAD_DIR, path.basename(s.image_file));
+      photosByFile.set(s.image_file, fs.existsSync(file) ? fs.readFileSync(file) : null);
+    }
+    const photoOf = (sherd) => photosByFile.get(sherd.image_file) || null;
+    return { project, sherds, seams, photoOf };
+  });
+  return readAll();
+}
+
+app.get('/api/projects/:id/export', wrap((req, res) => {
+  const pid = num(req.params.id, 'id');
+  const rows = snapshotPackage(pid);
+  if (!rows) throw new HttpError(404, '方案不存在');
+  let built;
+  try {
+    built = pkg.buildPackage(rows);
+  } catch (e) {
+    if (e instanceof pkg.PackageError) throw new HttpError(500, `导出失败：${e.message}`);
+    throw e;
+  }
+  const base = safeDownloadName(rows.project.name);
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition',
+    `attachment; filename="project-${rows.project.id}.zip"; filename*=UTF-8''${encodeURIComponent(`${base}.zip`)}`);
+  res.setHeader('X-Snapshot-Version', String(rows.project.version));
+  res.setHeader('X-Snapshot-Project-Id', String(rows.project.id));
+  res.send(built.zip);
+}));
+
+app.post('/api/projects/import', (req, res, next) => {
+  pkgUpload.single('package')(req, res, (err) => {
+    if (err) return next(err);
+    handlePackageImport(req, res, next);
+  });
+});
+
+const handlePackageImport = wrap(async (req, res) => {
+  if (!req.file || !req.file.buffer) throw new HttpError(400, '缺少方案包文件（multipart 字段名必须为 package，内容为 .zip）');
+
+  // 第一步：纯内存整包校验（含全部闭合环复核）。不合法直接抛 400/422，
+  // 此时尚未写库、尚未落盘，天然不留下方案或孤儿照片。
+  let inspected;
+  try {
+    inspected = pkg.inspectPackage(req.file.buffer);
+  } catch (e) {
+    if (e instanceof pkg.PackageError) {
+      const status = e.reason === 'import_cycle_tolerance_exceeded' ? 422 : 400;
+      throw new HttpError(status, e.message, { reason: e.reason, issues: e.issues });
+    }
+    throw e;
+  }
+
+  const { manifest, photos } = inspected;
+  const newPid = { value: null };
+  const writtenFiles = [];
+
+  // 落盘与建库分两阶段，任何阶段失败都保证“整包拒绝、不留方案、不留孤儿照片”：
+  //   A. 先把照片写到最终目录（服务器生成文件名）——写盘失败立即删除已写文件；
+  //   B. 再在单个事务内插入方案/陶片/接缝——事务回滚后删除 A 阶段全部照片。
+  const sherdFileBySeq = new Map();
+  try {
+    for (const sh of manifest.sherds) {
+      const data = photos.get(sh.photo);
+      const fname = `sherd_${Date.now()}_${Math.round(Math.random() * 1e9)}${sh.detected_ext}`;
+      fs.writeFileSync(path.join(UPLOAD_DIR, fname), data);
+      writtenFiles.push(fname);
+      sherdFileBySeq.set(sh.seq, fname);
+    }
+    const txn = db.transaction(() => {
+      const info = db
+        .prepare('INSERT INTO projects(name, tolerance_mm) VALUES (?, ?)')
+        .run(manifest.name, manifest.tolerance_mm);
+      const pid = info.lastInsertRowid;
+      newPid.value = pid;
+      // 陶片按 seq 升序插入 => 导入后本地 id 连续递增；seq=1 取最小新 id，
+      // 与源方案组件根片（最小旧 id）选择保持一致。
+      const insSherd = db.prepare(
+        'INSERT INTO sherds(project_id, label, image_file, img_w, img_h, scale_px, scale_mm, note) '
+        + 'VALUES (?,?,?,?,?,?,?,?)'
+      );
+      const idBySeq = new Map();
+      for (const sh of manifest.sherds.slice().sort((a, b) => a.seq - b.seq)) {
+        const r = insSherd.run(
+          pid, sh.label, sherdFileBySeq.get(sh.seq), sh.img_w, sh.img_h,
+          sh.scale_px == null ? null : sh.scale_px,
+          sh.scale_mm == null ? null : sh.scale_mm,
+          sh.note || ''
+        );
+        idBySeq.set(sh.seq, r.lastInsertRowid);
+      }
+      // 接缝按采纳顺序（数组位置 / seq）插入；from_id/to_id 重映射到新本地 id。
+      const insSeam = db.prepare(
+        'INSERT INTO seams(project_id, from_id, to_id, theta_deg, tx, ty, join_note) VALUES (?,?,?,?,?,?,?)'
+      );
+      for (const se of manifest.seams.slice().sort((a, b) => a.seq - b.seq)) {
+        insSeam.run(pid, idBySeq.get(se.from_seq), idBySeq.get(se.to_seq),
+          se.theta_deg, se.tx, se.ty, se.join_note || '');
+      }
+      // 导入不“编辑”新方案：版本保持初始 v1，与刚创建的方案一致。
+    });
+    txn();
+
+    const state = loadState(newPid.value);
+    res.status(201).json({
+      ...statePayload(state),
+      imported: true,
+      source: manifest.source || null,
+    });
+  } catch (e) {
+    // 建库失败（事务已回滚）或落盘失败：删除本次已写照片，避免孤儿文件；
+    // 若方案行已存在（极端情况下事务提交后的后续错误），显式删除以彻底清理。
+    if (newPid.value !== null) {
+      try { db.prepare('DELETE FROM projects WHERE id = ?').run(newPid.value); } catch { /* 事务回滚时已不存在 */ }
+    }
+    writtenFiles.forEach(deleteImageFile);
+    if (e instanceof HttpError) throw e;
+    throw new HttpError(500, `导入写入失败，已整包回滚，未留下方案或照片：${e.message}`);
+  }
+});
+
 // ---------- API: 陶片 ----------
 
 app.post('/api/projects/:id/sherds', (req, res, next) => {
@@ -756,12 +917,20 @@ app.post('/api/projects/:id/seams/batch-commit', wrap((req, res) => {
 
 // ---------- 错误处理 ----------
 
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   if (err instanceof HttpError) {
     return res.status(err.status).json({ error: { message: err.message, ...err.extra } });
   }
-  if (err && err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).json({ error: { message: `图片超过 ${MAX_UPLOAD_MB} MB 上限` } });
+  if (err && err.name === 'MulterError') {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      const importing = req.path === '/api/projects/import';
+      return res.status(400).json({
+        error: { message: importing
+          ? `方案包超过 ${MAX_PACKAGE_MB} MB 上限（可用环境变量 MAX_PACKAGE_MB 调整）`
+          : `图片超过 ${MAX_UPLOAD_MB} MB 上限` },
+      });
+    }
+    return res.status(400).json({ error: { message: `上传内容不合法：${err.message}` } });
   }
   console.error(err);
   res.status(500).json({ error: { message: '服务器内部错误' } });
